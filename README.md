@@ -154,7 +154,7 @@ cargo test --features ssr --lib          # uji unit
 cargo test --features ssr --test config_konkuren   # uji integrasi konfigurasi
 ```
 
-113 uji: normalisasi data, penyimpanan bergenerasi, model kerusakan (termasuk
+117 uji: normalisasi data, penyimpanan bergenerasi, model kerusakan (termasuk
 pemulihan parameter dari data simulasi), kebutuhan per skenario, konsistensi
 agregat di semua tingkat, forecast, rekomendasi, grafik, laporan PDF, ekspor
 beraliran, dan gerbang masuk. `cetak_ringkasan_contoh` (diabaikan secara
@@ -172,7 +172,9 @@ sendiri.
   pengembangan lokal); token sesi acak 256-bit disimpan di memori proses dan
   kedaluwarsa setelah 8 jam. Seluruh percobaan masuk diserialkan lewat satu
   gerbang dan percobaan salah diperlambat, sehingga tebakan paralel tidak dapat
-  mendahului penundaan (CWE-307).
+  mendahului penundaan (CWE-307). Antrean verifikasi dibatasi dan penundaan satu
+  percobaan dibatasi per alamat, sehingga penyerang tidak dapat mengunci operator
+  sah di belakang antrean percobaan salah (CWE-400).
 - Setiap respons membawa `X-Content-Type-Options: nosniff`,
   `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, dan
   `Cache-Control: no-store` (selain aset statis).

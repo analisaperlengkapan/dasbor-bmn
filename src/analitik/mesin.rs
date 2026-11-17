@@ -1339,7 +1339,7 @@ pub fn hitung(fakta: &[Fakta], kamus: &Kamus, k: &Konteks) -> Hasil {
 /// peringkat memakai skenario moderat saja, sehingga kelompok yang mahal pada
 /// skenario dasar atau maksimal (tetapi murah pada moderat) terbuang sebelum
 /// pengguna memilih skenario lain.
-fn potong_kelompok_butuh(daftar: &mut Vec<KelompokButuh>, batas: usize) {
+pub(crate) fn potong_kelompok_butuh(daftar: &mut Vec<KelompokButuh>, batas: usize) {
     daftar.sort_by(|a, b| {
         b.biaya_maks()
             .total_cmp(&a.biaya_maks())

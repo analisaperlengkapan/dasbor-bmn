@@ -54,6 +54,14 @@ const TUNDA_DASAR_MS: u64 = 300;
 /// Karena seluruh verifikasi diserialkan di gerbang, ini sekaligus lama
 /// maksimum satu percobaan menahan antrean sebelum percobaan berikutnya maju.
 const TUNDA_MAKS_MS: u64 = 30_000;
+/// Penundaan maksimum satu percobaan **per alamat**.
+///
+/// Penundaan global boleh mencapai `TUNDA_MAKS_MS`, tetapi satu alamat tidak
+/// pernah menahan gerbang lebih lama dari ini. Tanpa batas ini, penyerang yang
+/// mengantre banyak percobaan salah membuat setiap permintaan menahan gerbang
+/// sampai 30 detik, sehingga operator sah menunggu di belakang seluruh antrean
+/// (CWE-400).
+const TUNDA_MAKS_PER_ALAMAT_MS: u64 = 2_000;
 
 fn sessions() -> &'static Mutex<HashMap<String, Instant>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -87,11 +95,28 @@ fn alamat_lokal(ip: &IpAddr) -> bool {
 /// tidak terbatas (CWE-307); penundaan hanya menahan *jawaban*, bukan
 /// *pemeriksaan*. Karena pemeriksaan kini berjalan di dalam gerbang, satu
 /// percobaan yang benar pun tidak dapat mendahului antrean.
+///
+/// Antrean yang menunggu izin dibatasi agar penyerang tidak dapat menahan
+/// operator: percobaan yang datang saat antrean penuh langsung ditolak tanpa
+/// mengambil izin (CWE-400).
 static GERBANG_VERIFIKASI: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
 
 fn gerbang_verifikasi() -> &'static tokio::sync::Semaphore {
     GERBANG_VERIFIKASI.get_or_init(|| tokio::sync::Semaphore::new(1))
 }
+
+/// Jumlah percobaan yang sedang menunggu izin gerbang.
+///
+/// Dipakai untuk membatasi panjang antrean: bila sudah terlalu banyak yang
+/// menunggu, percobaan baru ditolak lebih awal alih-alih ikut menumpuk.
+static ANTREAN_MENUNGGU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Panjang antrean verifikasi maksimum.
+///
+/// Menjaga operator tetap dapat memperoleh izin gerbang: dengan penundaan satu
+/// alamat dibatasi `TUNDA_MAKS_PER_ALAMAT_MS`, antrean penuh pun selesai dalam
+/// hitungan detik, bukan menit (CWE-400).
+const MAKS_ANTREAN: usize = 8;
 
 /// Hasil satu percobaan masuk.
 enum Hasil {
@@ -99,16 +124,8 @@ enum Hasil {
     Sukses(String),
     /// Kata sandi salah; verifikasi sudah ditunda sesuai jumlah percobaan.
     Salah,
-}
-
-impl Hasil {
-    /// Sesi baru bila percobaan berhasil.
-    fn sesi(&self) -> Option<String> {
-        match self {
-            Hasil::Sukses(t) => Some(t.clone()),
-            Hasil::Salah => None,
-        }
-    }
+    /// Antrean verifikasi penuh; percobaan ditolak tanpa diperiksa.
+    Sibuk,
 }
 
 /// Verifikasi satu percobaan masuk.
@@ -118,11 +135,24 @@ impl Hasil {
 /// permintaan paralel tidak dapat sama-sama mencocokkan kata sandi sebelum
 /// penundaan berlaku, dan sebuah kata sandi benar tidak dapat menyerobot antrean
 /// untuk menerima sesi sambil meninggalkan percobaan salah yang masih tertunda
-/// (CWE-307). Bila percobaan yang benar menunggu di belakang antrean, hal itu
-/// memang disengaja: gerbang hanya menahan selama penundaan satu percobaan salah
-/// (maksimum `TUNDA_MAKS_MS`) dan membebaskan penundaan global saat berhasil,
-/// sehingga operator tidak dapat dikunci lama oleh percobaan orang lain (CWE-400).
+/// (CWE-307).
+///
+/// Antrean dibatasi `MAKS_ANTREAN`; percobaan yang datang saat antrean penuh
+/// ditolak lebih awal tanpa mengambil izin, dan percobaan salah hanya menahan
+/// gerbang selama penundaan satu alamat (maksimum `TUNDA_MAKS_PER_ALAMAT_MS`),
+/// sehingga penyerang tidak dapat menahan operator di belakang antrean panjang
+/// (CWE-400). Kata sandi benar selalu dilayani tanpa penundaan begitu izin
+/// diperoleh, dan mengosongkan penundaan percobaan salah yang tersisa.
 async fn verifikasi(password: &str, kunci: &str) -> Hasil {
+    use std::sync::atomic::Ordering;
+    // Tolak lebih awal bila antrean sudah penuh: jangan menambah penumpukan yang
+    // akan menahan operator. Tidak ada izin yang diambil, jadi tidak perlu
+    // dilepas.
+    if ANTREAN_MENUNGGU.fetch_add(1, Ordering::SeqCst) >= MAKS_ANTREAN {
+        ANTREAN_MENUNGGU.fetch_sub(1, Ordering::SeqCst);
+        return Hasil::Sibuk;
+    }
+    let _antre = Antrean;
     let _izin = gerbang_verifikasi()
         .acquire()
         .await
@@ -131,9 +161,19 @@ async fn verifikasi(password: &str, kunci: &str) -> Hasil {
         hapus_percobaan(kunci);
         return Hasil::Sukses(buat_sesi());
     }
-    let n = catat_gagal_global().max(catat_gagal(kunci));
-    tokio::time::sleep(tunda_percobaan(n)).await;
+    let n_alamat = catat_gagal(kunci);
+    let n_global = catat_gagal_global();
+    tokio::time::sleep(tunda_alamat(n_alamat, n_global)).await;
     Hasil::Salah
+}
+
+/// Pengurang penghitung antrean saat percobaan selesai (termasuk bila dibatalkan).
+struct Antrean;
+
+impl Drop for Antrean {
+    fn drop(&mut self) {
+        ANTREAN_MENUNGGU.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Kunci pembatasan: alamat TCP peer yang sebenarnya.
@@ -197,6 +237,20 @@ fn tunda_percobaan(n: u32) -> Duration {
         .saturating_mul(1u64 << langkah)
         .min(TUNDA_MAKS_MS);
     Duration::from_millis(ms)
+}
+
+/// Penundaan satu percobaan salah, dibatasi per alamat.
+///
+/// Penundaan global tetap dipakai untuk membatasi laju tebak-tebakan, tetapi
+/// tidak boleh menahan gerbang lebih lama dari `TUNDA_MAKS_PER_ALAMAT_MS` untuk
+/// satu percobaan. Dengan batas ini, banyak percobaan salah yang mengantre —
+/// termasuk dari banyak alamat palsu — tidak dapat mengunci operator sah di
+/// belakang antrean yang setiap langkahnya mencapai 30 detik (CWE-400).
+fn tunda_alamat(n_alamat: u32, n_global: u32) -> Duration {
+    let batas = Duration::from_millis(TUNDA_MAKS_PER_ALAMAT_MS);
+    let n = n_global.max(n_alamat);
+    let bawah = tunda_percobaan(n_alamat).min(batas);
+    tunda_percobaan(n).clamp(bawah, batas)
 }
 
 /// Hapus catatan percobaan setelah masuk berhasil.
@@ -566,9 +620,12 @@ pub async fn login(req: Request) -> Response {
     // sehingga permintaan paralel tidak dapat mencocokkan kata sandi bersamaan
     // sebelum penundaan berlaku (CWE-307). Percobaan yang benar ikut menunggu
     // antrean, tetapi tidak pernah ditunda karena kata sandinya salah.
-    match verifikasi(&form.password, &kunci).await.sesi() {
-        Some(token) => redirect_ke("/", Some(header_cookie(&token, https))),
-        None => halaman_galat("Kata sandi salah."),
+    match verifikasi(&form.password, &kunci).await {
+        Hasil::Sukses(token) => redirect_ke("/", Some(header_cookie(&token, https))),
+        Hasil::Salah => halaman_galat("Kata sandi salah."),
+        // Antrean penuh: beri tahu klien untuk mencoba lagi, tanpa menyatakan
+        // apa pun tentang kata sandi (CWE-400).
+        Hasil::Sibuk => halaman_galat("Terlalu banyak percobaan masuk. Coba lagi sesaat lagi."),
     }
 }
 
@@ -772,6 +829,106 @@ mod tests {
     fn tunda_dasar_di_bawah_ambang() {
         for n in 1..=MAKS_PERCOBAAN {
             assert_eq!(tunda_percobaan(n), Duration::from_millis(TUNDA_DASAR_MS));
+        }
+    }
+
+    /// Penundaan satu percobaan tidak pernah melebihi batas per alamat.
+    ///
+    /// Inilah inti perbaikan CWE-400: dulu penundaan mengikuti penghitung global
+    /// sampai `TUNDA_MAKS_MS`, sehingga penyerang yang mengantre banyak percobaan
+    /// salah membuat setiap percobaan menahan gerbang 30 detik dan operator sah
+    /// menunggu di belakang seluruh antrean. Kini satu percobaan paling lama
+    /// menahan gerbang `TUNDA_MAKS_PER_ALAMAT_MS`.
+    #[test]
+    fn penundaan_percobaan_dibatasi_per_alamat() {
+        let batas = Duration::from_millis(TUNDA_MAKS_PER_ALAMAT_MS);
+        for n_alamat in [0u32, 1, MAKS_PERCOBAAN, MAKS_GLOBAL, 40, 100, 500] {
+            for n_global in [0u32, 1, MAKS_GLOBAL, 40, 100, 500] {
+                assert!(
+                    tunda_alamat(n_alamat, n_global) <= batas,
+                    "penundaan melebihi batas per alamat: alamat={n_alamat} global={n_global}"
+                );
+            }
+        }
+        // Beban global tinggi tanpa riwayat alamat tetap ditunda sampai batas,
+        // sehingga laju tebak-tebakan tidak dibiarkan bebas.
+        assert_eq!(
+            tunda_alamat(0, MAKS_GLOBAL + 50),
+            batas,
+            "penundaan global tinggi harus mencapai batas per alamat"
+        );
+        // Penghitung per alamat yang tinggi menaikkan penundaan sampai batas,
+        // walaupun penghitung global rendah.
+        assert_eq!(tunda_alamat(MAKS_PERCOBAAN + 3, 1), batas);
+        // Di bawah ambang: penundaan dasar.
+        assert_eq!(tunda_alamat(1, 1), Duration::from_millis(TUNDA_DASAR_MS));
+    }
+
+    /// Antrean yang penuh menolak percobaan baru lebih awal, tanpa mengambil izin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn antrean_penuh_ditolak() {
+        let _k = kunci_uji();
+        let _ = kata_sandi_uji();
+        *global().lock().unwrap() = (0, Instant::now() + JENDELA_PERCOBAAN);
+        // Isi antrean melebihi batas dengan percobaan salah yang menahan gerbang.
+        let tugas: Vec<_> = (0..MAKS_ANTREAN + 3)
+            .map(|i| {
+                let kunci = format!("uji-antre-{i}");
+                tokio::spawn(async move { verifikasi("salah", &kunci).await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Percobaan yang datang saat antrean penuh ditolak seketika (Sibuk),
+        // bukan ikut menunggu.
+        let mulai = Instant::now();
+        let hasil = verifikasi("salah", "uji-antre-penuh").await;
+        assert!(
+            matches!(hasil, Hasil::Sibuk),
+            "antrean penuh harus menolak percobaan baru"
+        );
+        assert!(
+            mulai.elapsed() < Duration::from_millis(TUNDA_DASAR_MS),
+            "penolakan antrean penuh tidak boleh menunggu: {:?}",
+            mulai.elapsed()
+        );
+        for t in tugas {
+            let _ = t.await;
+        }
+    }
+
+    /// Operator tidak dikunci lama di belakang antrean percobaan salah.
+    ///
+    /// Penyerang mengisi antrean dengan percobaan salah; operator kemudian
+    /// mengirim kata sandi benar. Karena penundaan satu percobaan dibatasi
+    /// `TUNDA_MAKS_PER_ALAMAT_MS`, operator dilayani dalam hitungan detik —
+    /// bukan menunggu belasan percobaan × 30 detik (CWE-400).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn operator_tidak_terkunci_di_belakang_antrean() {
+        let _k = kunci_uji();
+        let benar = kata_sandi_uji();
+        // Beban global tinggi: tanpa batas per alamat, tiap percobaan menahan
+        // gerbang sampai 30 detik.
+        *global().lock().unwrap() = (MAKS_GLOBAL + 100, Instant::now() + JENDELA_PERCOBAAN);
+        let salah: Vec<_> = (0..2)
+            .map(|i| {
+                let kunci = format!("uji-kunci-{i}");
+                tokio::spawn(async move { verifikasi("salah", &kunci).await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Tanpa batas per alamat, operator menunggu puluhan detik; batas waktu
+        // membuat kegagalan terlihat cepat alih-alih menggantung lama.
+        let hasil = tokio::time::timeout(
+            Duration::from_millis(TUNDA_MAKS_PER_ALAMAT_MS * 3),
+            verifikasi(benar, "uji-operator-kunci"),
+        )
+        .await;
+        assert!(
+            matches!(hasil, Ok(Hasil::Sukses(_))),
+            "operator terkunci di belakang antrean percobaan salah"
+        );
+        for t in salah {
+            t.abort();
         }
     }
 

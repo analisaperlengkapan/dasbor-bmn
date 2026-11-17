@@ -121,6 +121,29 @@ fn warna_nada(nada: &str) -> &'static str {
     }
 }
 
+/// Kelompok barang untuk tabel kebutuhan satu skenario pada laporan PDF.
+///
+/// `kelompok_butuh` diurutkan menurut biaya **terbesar pada salah satu
+/// skenario** (lihat `potong_kelompok_butuh`). Tabel laporan menampilkan biaya
+/// satu skenario saja, jadi ia harus mengurutkan ulang kandidat menurut
+/// `biaya[sk]` sebelum memotong: tanpa itu, kelompok termahal pada skenario
+/// terpilih dapat hilang di belakang kelompok yang lebih murah (mis. mahal pada
+/// skenario maksimal tetapi murah pada moderat).
+fn kelompok_skenario(a: &Analisis, sk: usize, batas: usize) -> Vec<&KelompokButuh> {
+    let mut kandidat: Vec<&KelompokButuh> = a
+        .kelompok_butuh
+        .iter()
+        .filter(|k| k.unit[sk] >= 0.5)
+        .collect();
+    kandidat.sort_by(|x, y| {
+        y.biaya[sk]
+            .total_cmp(&x.biaya[sk])
+            .then(x.kelompok.cmp(&y.kelompok))
+    });
+    kandidat.truncate(batas);
+    kandidat
+}
+
 /// Halaman sampul: pita judul, identitas laporan, dan penanda data contoh.
 fn sampul(w: &mut Penulis, judul_besar: &str, sub: &str, m: &Meta, periode: &Periode) {
     use pdf::A4_W;
@@ -761,6 +784,9 @@ pub fn bangun_nasional(
         )),
     );
     w.sub("Kelompok barang dengan kebutuhan terbesar - skenario moderat");
+    // Urutkan ulang menurut biaya skenario moderat (sk=1) sebelum mengambil 18
+    // baris: daftar bersama diurutkan menurut biaya maksimum lintas skenario,
+    // sehingga kelompok termahal pada skenario moderat bisa hilang.
     w.tabel(
         &[
             kiri("Kelompok barang", 3.4),
@@ -771,10 +797,8 @@ pub fn bangun_nasional(
             kanan("Perkiraan biaya", 1.5),
             kanan("Idle baik", 1.0),
         ],
-        &a.kelompok_butuh
+        &kelompok_skenario(a, 1, 18)
             .iter()
-            .filter(|k| k.unit[1] >= 0.5)
-            .take(18)
             .map(|k| {
                 vec![
                     k.kelompok.clone(),
@@ -1317,6 +1341,66 @@ mod tests {
             },
         );
         assert!(String::from_utf8_lossy(&b).starts_with("%PDF-1.4"));
+    }
+
+    /// Kelompok mahal pada skenario moderat tidak boleh terbuang dari tabel PDF.
+    ///
+    /// Daftar bersama diurutkan menurut biaya maksimum lintas skenario. Bila
+    /// tabel PDF mengambil 18 baris pertama tanpa mengurutkan ulang menurut
+    /// biaya moderat, kelompok termahal pada skenario moderat dapat hilang di
+    /// belakang kelompok yang lebih murah pada moderat tetapi mahal pada
+    /// maksimal.
+    #[test]
+    fn tabel_pdf_mengurutkan_ulang_menurut_skenario_moderat() {
+        let buat = |kelompok: &str, biaya: [f64; 3]| KelompokButuh {
+            kategori: "Kategori".into(),
+            kelompok: kelompok.into(),
+            unit_total: 100,
+            unit: [50.0, 50.0, 50.0],
+            biaya,
+            harga: 1_000_000.0,
+            sumber_harga: "median 5 th".into(),
+            idle_baik: 0,
+        };
+        let mut a = Analisis::default();
+        // Delapan belas kelompok mahal pada maksimal tetapi murah pada moderat.
+        for i in 0..18 {
+            a.kelompok_butuh
+                .push(buat(&format!("Maks {i:02}"), [100.0, 100.0, 10_000.0]));
+        }
+        // Satu kelompok termahal pada moderat (biaya maksimumnya tetap terkecil).
+        a.kelompok_butuh
+            .push(buat("Moderat mahal", [1_000.0, 1_000.0, 1_000.0]));
+
+        // Keadaan setelah pemotongan bersama: semua 19 kelompok lolos batas 40.
+        crate::analitik::mesin::potong_kelompok_butuh(&mut a.kelompok_butuh, 40);
+        let posisi = a
+            .kelompok_butuh
+            .iter()
+            .position(|k| k.kelompok == "Moderat mahal")
+            .expect("kelompok harus ada");
+        assert!(
+            posisi >= 18,
+            "prasyarat: kelompok mahal pada moderat berada di luar 18 baris pertama"
+        );
+
+        let b = bangun_nasional(
+            &a,
+            &[],
+            &Periode {
+                tahun: 2026,
+                bulan: 6,
+            },
+            &AktivitasPeriode::default(),
+        );
+        let teks = String::from_utf8_lossy(&b);
+        let bagian = teks
+            .find("Kelompok barang dengan kebutuhan terbesar")
+            .expect("bagian tabel kelompok harus ada");
+        assert!(
+            teks[bagian..].contains("Moderat mahal"),
+            "tabel PDF membuang kelompok termahal pada skenario moderat"
+        );
     }
 
     #[test]
