@@ -590,6 +590,20 @@ pub struct KelompokButuh {
     pub idle_baik: i64,
 }
 
+impl KelompokButuh {
+    /// Biaya terbesar pada salah satu skenario.
+    ///
+    /// Peringkat dan pemotongan daftar memakai nilai ini, bukan satu skenario
+    /// saja: kelompok yang mahal pada skenario dasar atau maksimal tidak boleh
+    /// hilang hanya karena murah pada skenario moderat.
+    pub fn biaya_maks(&self) -> f64 {
+        self.biaya
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max)
+    }
+}
+
 /// Proyeksi nilai buku portofolio yang ada (tanpa pengadaan baru).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BukuTahun {

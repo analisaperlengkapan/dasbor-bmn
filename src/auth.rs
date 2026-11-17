@@ -49,7 +49,10 @@ const MAKS_PERCOBAAN: u32 = 5;
 const MAKS_GLOBAL: u32 = 30;
 /// Penundaan dasar tiap percobaan salah.
 const TUNDA_DASAR_MS: u64 = 300;
-/// Batas atas penundaan satu percobaan salah (detik).
+/// Batas atas penundaan satu percobaan salah (ms).
+///
+/// Karena seluruh verifikasi diserialkan di gerbang, ini sekaligus lama
+/// maksimum satu percobaan menahan antrean sebelum percobaan berikutnya maju.
 const TUNDA_MAKS_MS: u64 = 30_000;
 
 fn sessions() -> &'static Mutex<HashMap<String, Instant>> {
@@ -77,12 +80,13 @@ fn alamat_lokal(ip: &IpAddr) -> bool {
 
 /// Gerbang satu-slot untuk verifikasi kata sandi.
 ///
-/// Pemeriksaan kata sandi memakan waktu, dan penundaan percobaan salah tidak
-/// boleh menjadi satu-satunya pengaman: tanpa gerbang ini, banyak permintaan
-/// paralel sama-sama memeriksa kata sandi sebelum ada yang tertunda, sehingga
-/// laju tebak-tebakan lolos dari penundaan (CWE-307). Hanya satu permintaan
-/// yang boleh **menunggu** di sini; percobaan yang salah menahan izin selama
-/// penundaannya, sedangkan kata sandi yang benar tidak pernah menunggu.
+/// **Seluruh** percobaan — benar maupun salah — mengambil izin ini sebelum
+/// mencocokkan kata sandi, dan percobaan yang salah menahan izin selama
+/// penundaannya. Tanpa gerbang ini, banyak permintaan paralel sama-sama
+/// mencocokkan kata sandi sebelum ada yang tertunda, sehingga laju tebak-tebakan
+/// tidak terbatas (CWE-307); penundaan hanya menahan *jawaban*, bukan
+/// *pemeriksaan*. Karena pemeriksaan kini berjalan di dalam gerbang, satu
+/// percobaan yang benar pun tidak dapat mendahului antrean.
 static GERBANG_VERIFIKASI: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
 
 fn gerbang_verifikasi() -> &'static tokio::sync::Semaphore {
@@ -97,23 +101,36 @@ enum Hasil {
     Salah,
 }
 
+impl Hasil {
+    /// Sesi baru bila percobaan berhasil.
+    fn sesi(&self) -> Option<String> {
+        match self {
+            Hasil::Sukses(t) => Some(t.clone()),
+            Hasil::Salah => None,
+        }
+    }
+}
+
 /// Verifikasi satu percobaan masuk.
 ///
-/// Pemeriksaan kata sandi dilakukan lebih dulu **di luar** gerbang, sehingga
-/// operator yang mengirim kata sandi benar tidak pernah menunggu di belakang
-/// antrean percobaan salah (CWE-400). Hanya percobaan yang salah yang mengambil
-/// izin gerbang, lalu menghitung percobaan dan menahan izin selama penundaan;
-/// dengan begitu percobaan serentak tetap diserialkan dan tidak dapat
-/// menyelinap sebelum penundaan berlaku (CWE-307).
+/// Pencocokan kata sandi, penghitungan percobaan, dan penundaan berjalan **di
+/// dalam** gerbang, sehingga tiap percobaan diserialkan. Dengan begitu banyak
+/// permintaan paralel tidak dapat sama-sama mencocokkan kata sandi sebelum
+/// penundaan berlaku, dan sebuah kata sandi benar tidak dapat menyerobot antrean
+/// untuk menerima sesi sambil meninggalkan percobaan salah yang masih tertunda
+/// (CWE-307). Bila percobaan yang benar menunggu di belakang antrean, hal itu
+/// memang disengaja: gerbang hanya menahan selama penundaan satu percobaan salah
+/// (maksimum `TUNDA_MAKS_MS`) dan membebaskan penundaan global saat berhasil,
+/// sehingga operator tidak dapat dikunci lama oleh percobaan orang lain (CWE-400).
 async fn verifikasi(password: &str, kunci: &str) -> Hasil {
-    if cocok(password) {
-        hapus_percobaan(kunci);
-        return Hasil::Sukses(buat_sesi());
-    }
     let _izin = gerbang_verifikasi()
         .acquire()
         .await
         .expect("gerbang tertutup");
+    if cocok(password) {
+        hapus_percobaan(kunci);
+        return Hasil::Sukses(buat_sesi());
+    }
     let n = catat_gagal_global().max(catat_gagal(kunci));
     tokio::time::sleep(tunda_percobaan(n)).await;
     Hasil::Salah
@@ -166,9 +183,10 @@ fn catat_gagal_global() -> u32 {
 /// Lama penundaan untuk percobaan salah ke-`n`.
 ///
 /// Menaikkan penundaan secara berlipat setelah ambang terlampaui, lalu berhenti
-/// di `TUNDA_MAKS_MS`. Kata sandi yang benar tidak pernah ditunda, sehingga
-/// operator tidak dapat terkunci oleh percobaan orang lain (CWE-400), sementara
-/// laju tebak-tebakan tetap dibatasi ketat.
+/// di `TUNDA_MAKS_MS`. Hanya percobaan salah yang ditunda; kata sandi benar
+/// langsung dilayani begitu izin gerbang diperoleh, sehingga operator tidak
+/// dapat terkunci oleh percobaan orang lain (CWE-400), sementara laju
+/// tebak-tebakan tetap dibatasi ketat.
 fn tunda_percobaan(n: u32) -> Duration {
     let ambang = MAKS_PERCOBAAN.min(MAKS_GLOBAL);
     if n <= ambang {
@@ -544,13 +562,13 @@ pub async fn login(req: Request) -> Response {
         Ok(f) => f,
         Err(_) => return halaman_galat("Permintaan tidak terbaca."),
     };
-    // Verifikasi dan penghitungan percobaan berbagi satu gerbang, sehingga
-    // permintaan paralel tidak dapat memeriksa kata sandi bersamaan sebelum
-    // penundaan berlaku (CWE-307). Kata sandi yang benar tidak pernah ditunda,
-    // jadi operator tidak dapat dikunci oleh percobaan orang lain.
-    match verifikasi(&form.password, &kunci).await {
-        Hasil::Sukses(token) => redirect_ke("/", Some(header_cookie(&token, https))),
-        Hasil::Salah => halaman_galat("Kata sandi salah."),
+    // Verifikasi, penghitungan percobaan, dan penundaan berbagi satu gerbang,
+    // sehingga permintaan paralel tidak dapat mencocokkan kata sandi bersamaan
+    // sebelum penundaan berlaku (CWE-307). Percobaan yang benar ikut menunggu
+    // antrean, tetapi tidak pernah ditunda karena kata sandinya salah.
+    match verifikasi(&form.password, &kunci).await.sesi() {
+        Some(token) => redirect_ke("/", Some(header_cookie(&token, https))),
+        None => halaman_galat("Kata sandi salah."),
     }
 }
 
@@ -690,28 +708,64 @@ mod tests {
         );
     }
 
-    /// Kata sandi benar harus lolos walaupun antrean percobaan salah menumpuk.
+    /// Kata sandi benar dilayani tanpa penundaan percobaan salah.
     ///
-    /// Penundaan percobaan salah tidak boleh menahan operator (CWE-400): jalur
-    /// kata sandi benar tidak mengambil izin gerbang sama sekali.
+    /// Seluruh verifikasi kini diserialkan di gerbang (CWE-307), jadi percobaan
+    /// yang benar ikut menunggu percobaan salah yang sedang berjalan. Yang tidak
+    /// boleh terjadi: penundaan percobaan salah menahan operator lebih lama dari
+    /// satu penundaan dasar (CWE-400).
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
-    async fn kata_sandi_benar_tidak_terhalang_antrean() {
+    async fn kata_sandi_benar_tidak_ditunda() {
         let _k = kunci_uji();
         let benar = kata_sandi_uji();
         *global().lock().unwrap() = (0, Instant::now() + JENDELA_PERCOBAAN);
-        // Percobaan salah yang panjang menahan izin gerbang.
+        // Percobaan salah menahan gerbang selama TUNDA_DASAR_MS.
         let penyerang = tokio::spawn(verifikasi("salah", "uji-antre"));
         tokio::time::sleep(Duration::from_millis(50)).await;
-        // Operator mengirim kata sandi benar di tengah penundaan penyerang.
+        // Operator mengirim kata sandi benar: menunggu percobaan salah selesai,
+        // lalu dilayani tanpa penundaan tambahan.
         let mulai = Instant::now();
         let hasil = verifikasi(benar, "uji-operator").await;
         let tunggu = mulai.elapsed();
         assert!(matches!(hasil, Hasil::Sukses(_)));
         assert!(
-            tunggu < Duration::from_millis(TUNDA_DASAR_MS),
-            "operator terhalang antrean: {tunggu:?}"
+            tunggu >= Duration::from_millis(TUNDA_DASAR_MS - 100),
+            "percobaan benar mendahului percobaan salah: {tunggu:?}"
+        );
+        assert!(
+            tunggu < Duration::from_millis(TUNDA_DASAR_MS * 3),
+            "operator ditunda oleh percobaan salah: {tunggu:?}"
         );
         let _ = penyerang.await;
+    }
+
+    /// Tebakan yang benar tidak boleh menyerobot antrean percobaan salah.
+    ///
+    /// Inilah inti perbaikan CWE-307: dulu pencocokan kata sandi dilakukan di
+    /// luar gerbang, sehingga permintaan paralel dapat menguji kata sandi
+    /// berulang tanpa menunggu penundaan. Kini percobaan yang benar yang diajukan
+    /// di belakang tiga percobaan salah harus menunggu ketiganya selesai.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn percobaan_benar_tidak_menyerobot_antrean() {
+        let _k = kunci_uji();
+        let benar = kata_sandi_uji();
+        *global().lock().unwrap() = (0, Instant::now() + JENDELA_PERCOBAAN);
+        // Tiga percobaan salah lebih dulu; masing-masing menahan gerbang ~300 ms.
+        let salah: Vec<_> = (0..3)
+            .map(|_| tokio::spawn(verifikasi("salah", "uji-serobot")))
+            .collect();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mulai = Instant::now();
+        let hasil = verifikasi(benar, "uji-serobot").await;
+        let tunggu = mulai.elapsed();
+        assert!(matches!(hasil, Hasil::Sukses(_)));
+        assert!(
+            tunggu >= Duration::from_millis(700),
+            "tebakan benar menyerobot antrean percobaan salah: {tunggu:?}"
+        );
+        for t in salah {
+            let _ = t.await;
+        }
     }
 
     #[test]

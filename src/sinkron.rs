@@ -56,6 +56,32 @@ pub fn progres() -> Progres {
     keadaan().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Jalankan pekerjaan eksklusif yang mengubah cache (mis. menghapusnya).
+///
+/// Menahan penanda `berjalan` selama pekerjaan berlangsung sehingga `mulai`
+/// menolak sinkronisasi baru dan tidak ada potongan yang ditulis setelah
+/// pemeriksaan di luar kunci. Bila sinkronisasi lain sedang berjalan, pekerjaan
+/// tidak dijalankan dan galat dikembalikan. Pemeriksaan dan penandaan terjadi
+/// dalam satu kunci, jadi tidak ada celah antara "memeriksa" dan "memulai".
+pub fn jalankan_eksklusif<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    {
+        let mut p = keadaan().lock().unwrap_or_else(|e| e.into_inner());
+        if p.berjalan {
+            return Err("Sinkronisasi masih berjalan; tunggu sampai selesai.".into());
+        }
+        p.berjalan = true;
+    }
+    // Penjaga agar penanda dilepas walau `f` panik.
+    struct Lepas;
+    impl Drop for Lepas {
+        fn drop(&mut self) {
+            ubah(|p| p.berjalan = false);
+        }
+    }
+    let _lepas = Lepas;
+    Ok(f())
+}
+
 /// Mulai sinkronisasi tabel yang diminta (kosong = seluruh katalog).
 ///
 /// Mengembalikan galat bila pekerjaan lain masih berjalan atau nama tabel tidak dikenal.
@@ -90,8 +116,12 @@ pub fn mulai(diminta: &[String]) -> Result<(), String> {
             log: std::mem::take(&mut p.log),
         };
     }
+    // Sumber data dibekukan saat pekerjaan dimulai. Seluruh potongan memakai
+    // konfigurasi ini, sehingga perubahan kredensial di tengah unduhan tidak
+    // membuat sebagian baris datang dari sumber lain.
+    let sumber = config::get();
     tokio::spawn(async move {
-        jalankan(daftar).await;
+        jalankan(daftar, sumber).await;
         ubah(|p| {
             p.berjalan = false;
             p.selesai = crate::now_string();
@@ -100,8 +130,8 @@ pub fn mulai(diminta: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-async fn jalankan(daftar: Vec<&'static TableDef>) {
-    if !config::get().is_configured() {
+async fn jalankan(daftar: Vec<&'static TableDef>, sumber: config::Config) {
+    if !sumber.is_configured() {
         // Tanpa kredensial tidak ada sumber untuk ditarik: muat ulang data contoh.
         catat("Kredensial SLDK belum diisi — memuat ulang data contoh.".into());
         let hasil = tokio::task::spawn_blocking(|| {
@@ -131,7 +161,7 @@ async fn jalankan(daftar: Vec<&'static TableDef>) {
     let (mut sukses, mut gagal) = (0, 0);
     for def in daftar {
         ubah_tabel(def.table, |t| t.status = "berjalan".into());
-        match sinkron_tabel(def).await {
+        match sinkron_tabel(def, &sumber).await {
             Ok(n) => {
                 sukses += 1;
                 ubah_tabel(def.table, |t| {
@@ -161,13 +191,14 @@ async fn jalankan(daftar: Vec<&'static TableDef>) {
 
 /// Ambil satu potongan dengan percobaan ulang berjeda.
 async fn ambil(
+    cfg: &config::Config,
     resource: &str,
     id1: i64,
     id2: i64,
 ) -> Result<Option<Vec<serde_json::Value>>, sldk::SldkError> {
     let mut percobaan = 0;
     loop {
-        match sldk::fetch_rows(resource, id1, id2).await {
+        match sldk::fetch_rows_cfg(cfg, resource, id1, id2).await {
             Ok(v) => return Ok(v),
             // Kredensial yang belum lengkap tidak akan pulih dengan mengulang.
             Err(e @ sldk::SldkError::NotConfigured(_)) => return Err(e),
@@ -185,17 +216,28 @@ async fn ambil(
 }
 
 /// Tarik satu tabel utuh; isi lama dipertahankan bila unduhan gagal atau kurang.
-async fn sinkron_tabel(def: &'static TableDef) -> Result<i64, String> {
-    let total = sldk::row_count(def.table)
+async fn sinkron_tabel(def: &'static TableDef, sumber: &config::Config) -> Result<i64, String> {
+    let total = sldk::row_count_cfg(sumber, def.table)
         .await
         .map_err(|e| e.user_message())?;
     ubah_tabel(def.table, |t| t.total = total.max(0));
 
     let gen = store::gen_baru().map_err(|e| e.to_string())?;
+    let sidik = sldk::sidik_sumber(sumber);
     let mut terambil: i64 = 0;
     let mut id1: i64 = 1;
     while id1 <= total {
-        let potongan = match ambil(def.resource, id1, id1 + POTONGAN - 1).await {
+        // Kredensial berubah di tengah pekerjaan berarti potongan berikutnya
+        // datang dari sumber lain; batalkan agar hasil tidak mencampur dua
+        // sumber (jumlah baris bisa tetap "lengkap" walau isinya campuran).
+        if sldk::sidik_sumber(&config::get()) != sidik {
+            store::batal(def.table, gen);
+            return Err(
+                "Kredensial berubah saat sinkronisasi berjalan; data lama dipertahankan. Ulangi sinkronisasi."
+                    .into(),
+            );
+        }
+        let potongan = match ambil(sumber, def.resource, id1, id1 + POTONGAN - 1).await {
             Ok(Some(rows)) if !rows.is_empty() => rows,
             Ok(_) => break,
             Err(e) => {
@@ -247,5 +289,35 @@ mod tests {
             !progres().berjalan,
             "pekerjaan tidak boleh tercatat berjalan"
         );
+    }
+
+    /// Pekerjaan eksklusif (mis. penghapusan cache) dan sinkronisasi tidak boleh
+    /// berjalan bersamaan.
+    ///
+    /// Pemeriksaan "sedang berjalan?" dan penandaan kini terjadi dalam satu kunci,
+    /// jadi sinkronisasi tidak dapat mulai di antara keduanya dan menghapus
+    /// potongan yang sudah disisipkan. Digabung dalam satu uji karena keduanya
+    /// memakai penanda global yang sama.
+    #[test]
+    fn pekerjaan_eksklusif_terkunci_terhadap_sinkronisasi() {
+        ubah(|p| p.berjalan = false);
+        // Sinkronisasi "sedang berjalan": pekerjaan eksklusif harus ditolak dan
+        // tidak boleh mengubah penanda.
+        ubah(|p| p.berjalan = true);
+        assert!(
+            jalankan_eksklusif(|| ()).is_err(),
+            "pekerjaan eksklusif harus ditolak"
+        );
+        assert!(progres().berjalan, "penolakan tidak boleh mengubah penanda");
+        ubah(|p| p.berjalan = false);
+
+        // Tanpa sinkronisasi: pekerjaan berjalan dan penanda dilepas lagi.
+        let n = jalankan_eksklusif(|| {
+            assert!(progres().berjalan, "penanda harus aktif selama pekerjaan");
+            7
+        })
+        .unwrap();
+        assert_eq!(n, 7);
+        assert!(!progres().berjalan, "penanda harus dilepas setelah selesai");
     }
 }

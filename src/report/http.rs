@@ -164,7 +164,7 @@ pub async fn ekspor_csv(Query(params): Query<HashMap<String, String>>) -> Respon
         let mut putus = false;
         let hasil = store::alir_baris(&tabel, |v| {
             if putus {
-                return;
+                return false;
             }
             let baris: Vec<String> = kolom
                 .iter()
@@ -178,8 +178,11 @@ pub async fn ekspor_csv(Query(params): Query<HashMap<String, String>>) -> Respon
             baris_csv(&mut buf, &baris);
             if buf.len() >= POTONG {
                 // Penerima hilang berarti unduhan dibatalkan; hentikan pekerjaan.
+                // Mengembalikan `false` menghentikan pemindaian basis data juga,
+                // bukan hanya pengiriman potongan.
                 putus = tx.blocking_send(Ok(std::mem::take(&mut buf))).is_err();
             }
+            !putus
         });
         if putus {
             return;

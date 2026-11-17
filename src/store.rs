@@ -555,6 +555,65 @@ fn lolos_like(s: &str) -> String {
     out
 }
 
+/// Faktor konversi satuan kolom `umur_sisa` menjadi tahun (sama dengan mesin).
+fn faktor_satuan_umur() -> f64 {
+    match crate::config::asumsi().satuan_umur_sisa.as_str() {
+        "semester" => 0.5,
+        "bulan" => 1.0 / 12.0,
+        _ => 1.0,
+    }
+}
+
+/// Periode data acuan (tahun, bulan) dari sinkronisasi terakhir.
+fn periode_data() -> (i32, u32) {
+    sync_statuses()
+        .into_iter()
+        .filter_map(|(_, _, at)| at)
+        .max()
+        .and_then(|s| {
+            let y: i32 = s.get(0..4)?.parse().ok()?;
+            let m: u32 = s.get(5..7)?.parse().ok()?;
+            ((2000..=2100).contains(&y) && (1..=12).contains(&m)).then_some((y, m))
+        })
+        .unwrap_or_else(crate::tanggal_kini)
+}
+
+/// Ungkapan SQL yang setara dengan penentuan "habis masa manfaat" di mesin.
+///
+/// Mesin (`turunkan`) tidak menyamakan "habis" dengan `umur_sisa` nol mentah: ia
+/// memakai porsi nilai buku sebagai penentu bila `umur_sisa` nol tetapi aset
+/// masih bernilai, dan menaksir sisa umur dari nilai buku bila `umur_sisa` kosong.
+/// Filter halaman telusur harus memakai aturan yang sama, jika tidak "Habis masa
+/// manfaat" akan memuat nol yang menyesatkan dan melewatkan aset yang sudah habis
+/// menurut nilai bukunya. Masa manfaat yang dipakai adalah bawaan katalog (mesin
+/// dapat memperhalusnya dari data; selisih itu kecil dan tidak mengubah golongan
+/// besar aset).
+fn predikat_habis(def: &crate::model::TableDef, (tahun0, bulan0): (i32, u32)) -> String {
+    if !def.disusutkan {
+        return " AND 0".to_string();
+    }
+    let faktor = faktor_satuan_umur();
+    let masa = def.masa_manfaat;
+    let kini = tahun0 as f64 + (bulan0 as f64 - 0.5) / 12.0;
+    // Umur aset mengikuti `umur_aset`: bulan tak sah dianggap Juni, hasil dibatasi
+    // minimal nol, dan tahun di luar rentang membuat umur tidak diketahui.
+    let umur = format!(
+        "MAX({kini} - (a.tahun + (CASE WHEN a.bulan BETWEEN 1 AND 12 THEN a.bulan ELSE 6 END \
+         - 0.5) / 12.0), 0.0)"
+    );
+    format!(
+        " AND (
+            (a.umur_sisa IS NOT NULL AND a.umur_sisa * {faktor} <= 0
+                AND (a.nilai <= 1.0 OR (a.buku / a.nilai) <= 0.02))
+            OR
+            (a.umur_sisa IS NULL AND (
+                (a.nilai > 1.0 AND a.buku <= 0.0)
+                OR (a.nilai <= 1.0 AND a.tahun > 0 AND a.tahun <= {tahun0} AND {umur} >= {masa})
+            ))
+        )"
+    )
+}
+
 /// Ambil satu halaman baris aset: saring, urut, dan paginasi dikerjakan SQL.
 pub fn halaman(s: &Saring, columns: &[ColumnDef]) -> rusqlite::Result<(Vec<AssetRow>, i64)> {
     let c = baca()?;
@@ -587,7 +646,14 @@ pub fn halaman(s: &Saring, columns: &[ColumnDef]) -> rusqlite::Result<(Vec<Asset
     match s.status.as_str() {
         "idle" => di.push_str(&format!(" AND (a.flags & {}) <> 0", fakta::F_IDLE)),
         "hilang" => di.push_str(&format!(" AND (a.flags & {}) <> 0", fakta::F_HILANG)),
-        "habis" => di.push_str(" AND a.umur_sisa IS NOT NULL AND a.umur_sisa <= 0"),
+        "habis" => {
+            // Selaras dengan mesin analitik; tabel di luar katalog jatuh ke aturan
+            // mentah agar tidak pernah gagal.
+            match crate::catalog::find(&s.tabel) {
+                Some(def) => di.push_str(&predikat_habis(def, periode_data())),
+                None => di.push_str(" AND a.umur_sisa IS NOT NULL AND a.umur_sisa <= 0"),
+            }
+        }
         _ => {}
     }
     let acuan: Vec<&dyn ToSql> = par.iter().map(|b| b.as_ref()).collect();
@@ -628,7 +694,10 @@ pub fn halaman(s: &Saring, columns: &[ColumnDef]) -> rusqlite::Result<(Vec<Asset
 ///
 /// Dipakai ekspor. Kueri berjalan satu kali pada koneksi baca-saja, jadi seluruh
 /// baris berasal dari snapshot yang sama meski sinkronisasi berjalan di sampingnya.
-pub fn alir_baris(tabel: &str, mut f: impl FnMut(&Value)) -> rusqlite::Result<()> {
+/// Callback mengembalikan `false` untuk menghentikan pemindaian lebih awal —
+/// dipakai saat unduhan dibatalkan agar pembacaan basis data dan penguraian JSON
+/// tidak berlanjut sampai baris terakhir.
+pub fn alir_baris(tabel: &str, mut f: impl FnMut(&Value) -> bool) -> rusqlite::Result<()> {
     let c = baca()?;
     let mut stmt = c.prepare(
         "SELECT a.data FROM aset a JOIN sync_meta m ON m.table_name = a.tabel AND m.gen = a.gen
@@ -637,7 +706,9 @@ pub fn alir_baris(tabel: &str, mut f: impl FnMut(&Value)) -> rusqlite::Result<()
     let mut rows = stmt.query(params![tabel])?;
     while let Some(r) = rows.next()? {
         if let Ok(v) = serde_json::from_str::<Value>(r.get_ref(0)?.as_str().unwrap_or("")) {
-            f(&v);
+            if !f(&v) {
+                break;
+            }
         }
     }
     Ok(())
@@ -752,6 +823,7 @@ mod tests {
         alir_baris(t, |v| {
             assert!(v["kd_brg"].as_str().unwrap().starts_with('L'));
             lama += 1;
+            true
         })
         .unwrap();
         assert_eq!(lama, 5);
@@ -851,6 +923,73 @@ mod tests {
         s.q.clear();
         s.sort = "data; DROP TABLE aset".into();
         assert_eq!(halaman(&s, &kol).unwrap().1, 30);
+    }
+
+    /// Filter "Habis masa manfaat" harus sejalan dengan mesin analitik.
+    ///
+    /// Dulu filter hanya melihat `umur_sisa <= 0` mentah: aset bersisa nol yang
+    /// masih bernilai buku ikut terhitung "habis" (nol menyesatkan), sedangkan
+    /// aset tanpa sisa umur yang nilai bukunya sudah habis justru terlewat.
+    #[test]
+    fn status_habis_selaras_dengan_analitik() {
+        let _k = uji_kunci();
+        let t = "SIMAN2_M_ASET_KHUSUS_TIK"; // disusutkan, masa manfaat 4 tahun
+        let rows = vec![
+            // Sisa 0 tetapi nilai buku masih 60% → belum habis.
+            json!({"kd_brg":"A1","nama":"Belum habis","rph_aset":1000000,"rph_buku":600000,
+                   "umur_sisa":0,"tgl_perlh":"2018-06-01"}),
+            // Sisa 0 dan nilai buku habis → habis.
+            json!({"kd_brg":"A2","nama":"Habis buku","rph_aset":1000000,"rph_buku":0,
+                   "rph_susut":1000000,"umur_sisa":0,"tgl_perlh":"2015-06-01"}),
+            // Tanpa sisa umur tetapi nilai buku habis → habis (dulu terlewat).
+            json!({"kd_brg":"A3","nama":"Tanpa sisa","rph_aset":1000000,"rph_buku":0,
+                   "rph_susut":1000000,"tgl_perlh":"2015-06-01"}),
+            // Sisa umur positif → belum habis.
+            json!({"kd_brg":"A4","nama":"Sisa positif","rph_aset":1000000,"rph_buku":500000,
+                   "umur_sisa":2,"tgl_perlh":"2024-06-01"}),
+        ];
+        ganti_tabel(t, rows, "2026-06-15").unwrap();
+        let kol = kolom(&["kd_brg", "nama"]);
+        let s = Saring {
+            tabel: t.into(),
+            kondisi: -1,
+            status: "habis".into(),
+            page: 1,
+            per_page: 50,
+            ..Default::default()
+        };
+        let (rows, total) = halaman(&s, &kol).unwrap();
+        let kode: Vec<String> = rows.iter().map(|r| r.values[0].clone()).collect();
+        assert_eq!(total, 2, "kode: {kode:?}");
+        assert!(kode.contains(&"A2".into()), "nilai buku habis harus ikut");
+        assert!(
+            kode.contains(&"A3".into()),
+            "sisa kosong + nilai buku habis harus ikut: {kode:?}"
+        );
+        assert!(
+            !kode.contains(&"A1".into()),
+            "sisa 0 tetapi nilai buku 60% tidak habis: {kode:?}"
+        );
+        assert!(!kode.contains(&"A4".into()), "sisa positif tidak habis");
+    }
+
+    /// Pemindaian ekspor harus dapat dihentikan lebih awal.
+    ///
+    /// Saat unduhan dibatalkan, callback mengembalikan `false`; pembacaan basis
+    /// data dan penguraian JSON harus berhenti, bukan berlanjut sampai baris
+    /// terakhir sambil menahan pekerja dan snapshot baca.
+    #[test]
+    fn alir_baris_berhenti_saat_diminta() {
+        let _k = uji_kunci();
+        let t = "UJI_BATAL_ALIR";
+        ganti_tabel(t, baris(100, "Z"), "t0").unwrap();
+        let mut n = 0;
+        alir_baris(t, |_v| {
+            n += 1;
+            n < 10
+        })
+        .unwrap();
+        assert_eq!(n, 10, "pemindaian harus berhenti setelah callback menolak");
     }
 
     #[test]

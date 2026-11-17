@@ -197,18 +197,21 @@ pub async fn save_asumsi(
 /// Hapus cache lokal (kembali ke mode contoh bila kredensial belum diisi).
 #[server]
 pub async fn reset_cache() -> Result<Vec<SyncStatus>, ServerFnError> {
-    if sinkron::progres().berjalan {
-        return Err(ServerFnError::new(
-            "Sinkronisasi masih berjalan; tunggu sampai selesai.",
-        ));
-    }
     eprintln!("[audit] cache lokal dihapus");
+    // Penghapusan dijalankan di bawah penanda eksklusif sinkronisasi: pemeriksaan
+    // "sedang berjalan?" dan penandaan terjadi dalam satu kunci, sehingga
+    // sinkronisasi tidak dapat mulai di antara pemeriksaan dan penghapusan —
+    // dulu sinkronisasi yang lolos celah itu menyisakan potongan yang sudah
+    // disisipkan, lalu menghapusnya sebagian dan mengira unduhan sudah lengkap.
     di_latar(|| {
-        store::clear_all().map_err(|e| e.to_string())?;
-        demo::pastikan();
-        Ok::<_, String>(store::statuses_with_labels())
+        sinkron::jalankan_eksklusif(|| {
+            store::clear_all().map_err(|e| e.to_string())?;
+            demo::pastikan();
+            Ok::<_, String>(store::statuses_with_labels())
+        })
     })
     .await?
+    .and_then(|v| v)
     .map_err(ServerFnError::new)
 }
 

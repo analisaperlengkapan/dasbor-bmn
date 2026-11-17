@@ -1176,12 +1176,11 @@ pub fn hitung(fakta: &[Fakta], kamus: &Kamus, k: &Konteks) -> Hasil {
             idle_baik: b.idle_baik,
         })
         .collect();
-    kelompok_butuh.sort_by(|a, b| {
-        b.biaya[1]
-            .total_cmp(&a.biaya[1])
-            .then(a.kelompok.cmp(&b.kelompok))
-    });
-    kelompok_butuh.truncate(40);
+    // Daftar "apa yang perlu diadakan" dipotong 40 kelompok. Urutkan menurut
+    // biaya terbesar pada salah satu skenario, bukan skenario moderat saja:
+    // dulu kelompok berbiaya besar pada skenario dasar/maksimal tetapi kecil
+    // pada moderat ikut terbuang sebelum pengguna memilih skenario lain.
+    potong_kelompok_butuh(&mut kelompok_butuh, 40);
 
     // Daftar aset prioritas nasional.
     calon_rb.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -1332,6 +1331,21 @@ pub fn hitung(fakta: &[Fakta], kamus: &Kamus, k: &Konteks) -> Hasil {
         model,
         konteks: k.clone(),
     }
+}
+
+/// Urutkan dan potong daftar kebutuhan kelompok barang.
+///
+/// Peringkat memakai biaya **terbesar pada salah satu skenario**. Sebelumnya
+/// peringkat memakai skenario moderat saja, sehingga kelompok yang mahal pada
+/// skenario dasar atau maksimal (tetapi murah pada moderat) terbuang sebelum
+/// pengguna memilih skenario lain.
+fn potong_kelompok_butuh(daftar: &mut Vec<KelompokButuh>, batas: usize) {
+    daftar.sort_by(|a, b| {
+        b.biaya_maks()
+            .total_cmp(&a.biaya_maks())
+            .then(a.kelompok.cmp(&b.kelompok))
+    });
+    daftar.truncate(batas);
 }
 
 #[cfg(test)]
@@ -1585,6 +1599,37 @@ pub mod uji {
         let mut p: Vec<i64> = h.simpan.values().map(|s| s.peringkat).collect();
         p.sort();
         assert_eq!(p, (1..=h.simpan.len() as i64).collect::<Vec<_>>());
+    }
+
+    /// Kelompok yang mahal pada skenario dasar/maksimal tidak boleh terbuang.
+    ///
+    /// Dulu peringkat memakai biaya skenario moderat saja. Kelompok yang mahal
+    /// pada skenario dasar atau maksimal (tetapi murah pada moderat) hilang dari
+    /// daftar sebelum pengguna sempat memilih skenario itu.
+    #[test]
+    fn pemotongan_kelompok_menyertakan_semua_skenario() {
+        let buat = |kelompok: &str, biaya: [f64; 3]| KelompokButuh {
+            kelompok: kelompok.into(),
+            biaya,
+            ..Default::default()
+        };
+        // 40 kelompok yang hanya mahal pada skenario moderat.
+        let mut daftar: Vec<KelompokButuh> = (0..40)
+            .map(|i| buat(&format!("Moderat {i:02}"), [0.0, 1000.0, 0.0]))
+            .collect();
+        // Mahal hanya pada skenario dasar.
+        daftar.push(buat("Dasar mahal", [5000.0, 0.0, 0.0]));
+        // Mahal hanya pada skenario maksimal.
+        daftar.push(buat("Maksimal mahal", [0.0, 0.0, 5000.0]));
+
+        potong_kelompok_butuh(&mut daftar, 40);
+        assert_eq!(daftar.len(), 40);
+        assert_eq!(daftar[0].kelompok, "Dasar mahal");
+        assert_eq!(daftar[1].kelompok, "Maksimal mahal");
+        assert!(
+            daftar.iter().all(|k| k.kelompok != "Moderat 39"),
+            "kelompok moderat termurah harus terbuang"
+        );
     }
 
     #[test]

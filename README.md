@@ -150,14 +150,18 @@ src/
 ## Pengujian
 
 ```bash
-cargo test --features ssr --lib
+cargo test --features ssr --lib          # uji unit
+cargo test --features ssr --test config_konkuren   # uji integrasi konfigurasi
 ```
 
-105 uji: normalisasi data, penyimpanan bergenerasi, model kerusakan (termasuk
+113 uji: normalisasi data, penyimpanan bergenerasi, model kerusakan (termasuk
 pemulihan parameter dari data simulasi), kebutuhan per skenario, konsistensi
 agregat di semua tingkat, forecast, rekomendasi, grafik, laporan PDF, ekspor
 beraliran, dan gerbang masuk. `cetak_ringkasan_contoh` (diabaikan secara
-bawaan) mencetak ringkasan data contoh untuk pemeriksaan manual.
+bawaan) mencetak ringkasan data contoh untuk pemeriksaan manual. Uji integrasi
+`config_konkuren` memeriksa penyimpanan konfigurasi (penulisan atomik dan
+serialisasi kredensial/asumsi); ia dipisah karena mengatur `SIMAN_DATA_DIR`
+sendiri.
 
 ## Keamanan
 
@@ -166,12 +170,18 @@ bawaan) mencetak ringkasan data contoh untuk pemeriksaan manual.
   tanpa sesi dijawab `401`.
 - Sesi memakai cookie `HttpOnly`, `SameSite=Strict`, dan `Secure` (kecuali
   pengembangan lokal); token sesi acak 256-bit disimpan di memori proses dan
-  kedaluwarsa setelah 8 jam. Percobaan masuk dibatasi dan diperlambat.
+  kedaluwarsa setelah 8 jam. Seluruh percobaan masuk diserialkan lewat satu
+  gerbang dan percobaan salah diperlambat, sehingga tebakan paralel tidak dapat
+  mendahului penundaan (CWE-307).
 - Setiap respons membawa `X-Content-Type-Options: nosniff`,
   `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, dan
   `Cache-Control: no-store` (selain aset statis).
 - Rahasia hanya tersimpan di server dan tidak pernah dikirim balik ke peramban.
 - Direktori data dibatasi `0700`; berkas kredensial dan basis data `0600`.
+  Berkas konfigurasi ditulis ke berkas sementara lalu diganti dengan `rename`,
+  sehingga pembaca tidak pernah melihat dokumen terpotong atau kosong.
+- Perubahan kredensial di tengah sinkronisasi membatalkan pekerjaan itu, agar
+  satu generasi data tidak mencampur dua sumber.
 - Ekspor CSV menetralkan sel yang dimulai `= + - @`.
 - Unduhan laporan, ekspor, dan sinkronisasi dicatat ke log proses.
 - **Belum ada**: akun per pengguna/peran, jejak audit tersimpan, dan

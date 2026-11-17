@@ -50,6 +50,18 @@ pub struct FileConfig {
 #[cfg(feature = "ssr")]
 static CONFIG: OnceLock<RwLock<Config>> = OnceLock::new();
 
+/// Kunci tunggal untuk seluruh baca-ubah-tulis berkas konfigurasi.
+///
+/// Kredensial dan asumsi tinggal di satu berkas JSON. Tanpa kunci bersama,
+/// dua penyimpanan yang berjalan bersamaan membaca salinan lama yang sama lalu
+/// saling menimpa, sehingga perubahan yang sah (mis. kredensial baru) hilang
+/// walau kedua permintaan melaporkan berhasil.
+#[cfg(feature = "ssr")]
+fn kunci_simpan() -> &'static std::sync::Mutex<()> {
+    static K: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    K.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 #[cfg(feature = "ssr")]
 fn read_file_config() -> FileConfig {
     std::fs::read_to_string(config_path())
@@ -107,6 +119,7 @@ pub fn get() -> Config {
 /// Simpan konfigurasi ke `data/config.json` dan terapkan segera.
 #[cfg(feature = "ssr")]
 pub fn save_file_config(patch: FileConfig) -> std::io::Result<()> {
+    let _k = kunci_simpan().lock().unwrap_or_else(|e| e.into_inner());
     let path = config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -126,12 +139,11 @@ pub fn save_file_config(patch: FileConfig) -> std::io::Result<()> {
     }
     // Rahasia ditulis dengan mode 0600 agar tidak terbaca pengguna lokal lain.
     crate::fs_aman::tulis_privat(&path, serde_json::to_string_pretty(&current)?.as_bytes())?;
-    let mut c = get();
-    c.client_id = current.client_id.clone();
-    c.client_secret = current.client_secret.clone();
-    c.grant_type = current.grant_type.clone();
-    c.ba_key = current.ba_key.clone();
-    *CONFIG.get_or_init(|| RwLock::new(load())).write().unwrap() = c;
+    // Muat ulang dari berkas lalu terapkan seluruh medan. Memakai `get()` (bukan
+    // menimpa satu per satu dari `current`) penting: bila hanya medan yang diisi
+    // pengguna yang diterapkan, kredensial dari environment yang dibiarkan kosong
+    // di berkas akan hilang dari konfigurasi aktif sampai proses dimulai ulang.
+    *CONFIG.get_or_init(|| RwLock::new(load())).write().unwrap() = load();
     // Token lama diterbitkan untuk kredensial lama, jadi tidak boleh dipakai lagi.
     crate::sldk::lupakan_token();
     Ok(())
@@ -192,6 +204,9 @@ pub fn asumsi() -> crate::dto::Asumsi {
 /// Simpan asumsi analitik ke berkas konfigurasi.
 #[cfg(feature = "ssr")]
 pub fn simpan_asumsi(a: &crate::dto::Asumsi) -> std::io::Result<()> {
+    // Kunci yang sama dengan penyimpanan kredensial: asumsi dan kredensial
+    // tinggal di satu berkas, jadi keduanya tidak boleh saling menimpa.
+    let _k = kunci_simpan().lock().unwrap_or_else(|e| e.into_inner());
     let path = config_path();
     let mut current = read_file_config();
     current.eskalasi = Some(a.eskalasi.clamp(0.0, 0.25));

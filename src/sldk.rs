@@ -52,6 +52,27 @@ fn sidik_kredensial(cfg: &config::Config) -> u64 {
     h.finish()
 }
 
+/// Sidik jari **sumber data**: seluruh medan yang menentukan isi yang ditarik.
+///
+/// Berbeda dari sidik token (kredensial SSO saja), sidik ini juga memuat
+/// `BA_KEY` dan `base_url`. Sinkronisasi memakainya untuk memastikan seluruh
+/// potongan satu pekerjaan berasal dari sumber yang sama: bila kredensial
+/// berubah di tengah unduhan, sisa potongan akan datang dari sumber lain dan
+/// menghasilkan campuran yang tampak lengkap (jumlah baris cocok) walau isinya
+/// berasal dari dua sumber. Sinkronisasi membandingkan sidik ini tiap potongan
+/// dan membatalkan diri bila berubah.
+pub fn sidik_sumber(cfg: &config::Config) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    cfg.base_url.hash(&mut h);
+    cfg.token_url.hash(&mut h);
+    cfg.client_id.hash(&mut h);
+    cfg.client_secret.hash(&mut h);
+    cfg.grant_type.hash(&mut h);
+    cfg.ba_key.hash(&mut h);
+    h.finish()
+}
+
 /// Buang token tersimpan; dipanggil saat kredensial berubah.
 pub fn lupakan_token() {
     if let Some(lock) = TOKEN.get() {
@@ -72,13 +93,21 @@ fn http() -> &'static reqwest::Client {
 
 /// Ambil token akses SSO, memakai cache selama masa berlakunya (1 jam).
 pub async fn token() -> Result<String, SldkError> {
-    let cfg = config::get();
+    token_cfg(&config::get()).await
+}
+
+/// Seperti `token`, tetapi memakai konfigurasi yang diberikan pemanggil.
+///
+/// Sinkronisasi menangkap satu konfigurasi utuh di awal pekerjaan dan
+/// memakainya untuk seluruh potongan, sehingga perubahan kredensial di tengah
+/// unduhan tidak membuat sebagian potongan diambil dengan kredensial lain.
+pub async fn token_cfg(cfg: &config::Config) -> Result<String, SldkError> {
     if cfg.client_id.is_empty() || cfg.client_secret.is_empty() {
         return Err(SldkError::NotConfigured(
             "Client ID / Client Secret belum diisi.".to_string(),
         ));
     }
-    let sidik = sidik_kredensial(&cfg);
+    let sidik = sidik_kredensial(cfg);
     let lock = TOKEN.get_or_init(|| Mutex::new(None));
     if let Some(t) = lock.lock().unwrap().as_ref() {
         if t.sidik == sidik && t.expires_at > Instant::now() + Duration::from_secs(30) {
@@ -128,11 +157,15 @@ pub async fn token() -> Result<String, SldkError> {
 
 /// Jumlah baris satu tabel pada rentang yang diberikan gateway.
 pub async fn row_count(table: &str) -> Result<i64, SldkError> {
-    let cfg = config::get();
+    row_count_cfg(&config::get(), table).await
+}
+
+/// Seperti `row_count`, tetapi memakai konfigurasi yang diberikan pemanggil.
+pub async fn row_count_cfg(cfg: &config::Config, table: &str) -> Result<i64, SldkError> {
     if cfg.ba_key.is_empty() {
         return Err(SldkError::NotConfigured("BA_KEY belum diisi.".to_string()));
     }
-    let tok = token().await?;
+    let tok = token_cfg(cfg).await?;
     let url = format!(
         "{}/SLDKSimanKL/2.0/getRowCount/{}/{}",
         cfg.gateway_root(),
@@ -234,11 +267,23 @@ pub async fn fetch_rows(
     id1: i64,
     id2: i64,
 ) -> Result<Option<Vec<Value>>, SldkError> {
-    let cfg = config::get();
+    fetch_rows_cfg(&config::get(), resource, id1, id2).await
+}
+
+/// Seperti `fetch_rows`, tetapi memakai konfigurasi yang diberikan pemanggil.
+///
+/// Sinkronisasi menyerahkan satu konfigurasi tetap untuk seluruh potongan, agar
+/// setiap potongan diambil dari sumber yang sama walau kredensial berubah.
+pub async fn fetch_rows_cfg(
+    cfg: &config::Config,
+    resource: &str,
+    id1: i64,
+    id2: i64,
+) -> Result<Option<Vec<Value>>, SldkError> {
     if cfg.ba_key.is_empty() {
         return Err(SldkError::NotConfigured("BA_KEY belum diisi.".to_string()));
     }
-    let tok = token().await?;
+    let tok = token_cfg(cfg).await?;
     let url = format!("{}/SLDKSimanKL/2.0/{}", cfg.gateway_root(), resource);
     let params = [
         ("BA_KEY", cfg.ba_key.clone()),
@@ -351,7 +396,8 @@ pub async fn health() -> Result<(bool, Option<String>), ()> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_row_count;
+    use super::{parse_row_count, sidik_sumber};
+    use crate::config;
     use serde_json::json;
 
     #[test]
@@ -483,5 +529,32 @@ mod tests {
             extract_rows(&json!("gateway sibuk")),
             Beberapa::TakDikenal(_)
         ));
+    }
+
+    /// Sidik sumber harus berubah bila medan apa pun yang menentukan isi berubah.
+    ///
+    /// Dipakai sinkronisasi untuk mendeteksi kredensial yang berubah di tengah
+    /// unduhan; bila sidik tidak peka terhadap `BA_KEY` atau `base_url`, potongan
+    /// dari dua sumber dapat tercampur dan tetap lolos pemeriksaan jumlah baris.
+    #[test]
+    fn sidik_sumber_peka_terhadap_perubahan_kredensial() {
+        let dasar = config::Config {
+            base_url: "https://a.example".into(),
+            token_url: "https://a.example/token".into(),
+            client_id: "id".into(),
+            client_secret: "rahasia".into(),
+            grant_type: "client_credentials".into(),
+            ba_key: "ba-1".into(),
+        };
+        assert_eq!(sidik_sumber(&dasar), sidik_sumber(&dasar.clone()));
+        let ubah = |f: fn(&mut config::Config)| {
+            let mut c = dasar.clone();
+            f(&mut c);
+            sidik_sumber(&c)
+        };
+        assert_ne!(sidik_sumber(&dasar), ubah(|c| c.ba_key = "ba-2".into()));
+        assert_ne!(sidik_sumber(&dasar), ubah(|c| c.client_secret = "lain".into()));
+        assert_ne!(sidik_sumber(&dasar), ubah(|c| c.base_url = "https://b.example".into()));
+        assert_ne!(sidik_sumber(&dasar), ubah(|c| c.client_id = "id-2".into()));
     }
 }
